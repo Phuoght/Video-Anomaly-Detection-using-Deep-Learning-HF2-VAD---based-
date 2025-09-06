@@ -7,17 +7,17 @@ Some features, experiments, and results may not be final. The repository will be
 
 ---
 
-## 🔍 Introduction  
+## Introduction  
 
 This project is based on [hf2vad](https://github.com/LiUzHiAn/hf2vad), which originally implemented:  
 
-- **ML-MEMAE-SC** (Memory-Augmented Autoencoder)  
-- **CVAE (VUNet)** (Conditional Variational Autoencoder with ResNet backbone)  
+- **ML-MEMAE-SC** (Multi Level Memory-Augmented Autoencoder with Skip Connections)  
+- **CVAE (VUNet)** (Conditional Variational Autoencoder)  
 
-### ✨ Goal of This Work  
+### Goal of This Work  
 - Focus on **improving CVAE** by integrating **Transformer blocks** into the encoder.  
 - Leverage **global context modeling** and **long-range dependencies** that ResNet alone cannot capture.  
-- Aim to achieve **better anomaly detection accuracy** on benchmark datasets (Ped2, Avenue, ShanghaiTech).  
+- Aim to achieve **better anomaly detection accuracy** on benchmark datasets (UCSD Ped2, CUHK Avenue, ShanghaiTech).  
 
 ---
 
@@ -26,8 +26,10 @@ This project is based on [hf2vad](https://github.com/LiUzHiAn/hf2vad), which ori
 - Integrated Transformer into CVAE encoder  
 - Training pipeline prepared  
 - Basic evaluation implemented  
-- Experiments ongoing (Ped2, Avenue, ShanghaiTech)  
+- Experiments ongoing (UCSD Ped2, CUHK Avenue, ShanghaiTech) 
 - Writing documentation & detailed results  
+
+---
 
 ## Preliminary Results
 | Dataset      | Method              | AUC (%) |
