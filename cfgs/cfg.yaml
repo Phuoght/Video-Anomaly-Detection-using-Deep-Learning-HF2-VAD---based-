@@ -35,7 +35,7 @@ saveevery: 1
 
 # training setting
 num_epochs: 80
-batchsize: 128
+batchsize: 64
 lr: 0.0001
 num_workers: 8
 # alpha for gradient loss
