@@ -1,22 +1,23 @@
 import gc
 import os
 import torch
+from torch.utils.data import DataLoader
+from torch import optim
+from tensorboardX import SummaryWriter
 import torch.nn as nn
 import numpy as np
 import yaml
 import shutil
-from torch.utils.data import DataLoader
-from torch import optim
-from tensorboardX import SummaryWriter
+from eval import evaluate
 from tqdm import tqdm
 
-from losses.loss import CombinedLoss
+from losses.loss import Gradient_Loss, Intensity_Loss, aggregate_kl_loss
 from datasets.dataset import Chunked_sample_dataset, img_batch_tensor2numpy
 from models.mem_cvae import HFVAD
+
 from utils.initialization_utils import weights_init_kaiming
 from utils.vis_utils import visualize_sequences
 from utils.model_utils import loader, saver, only_model_saver
-from eval import evaluate
 
 
 def train(config, training_chunked_samples_dir, testing_chunked_samples_file):
@@ -32,9 +33,11 @@ def train(config, training_chunked_samples_dir, testing_chunked_samples_file):
     lr = config["lr"]
     training_chunk_samples_files = sorted(os.listdir(training_chunked_samples_dir))
 
-    # Loss wrapper (CombinedLoss includes intensity/grad/percep/ssim)
-    combined_loss = CombinedLoss(config, device=device)
-    combined_loss = combined_loss.to(device)
+    # loss functions
+    grad_loss = Gradient_Loss(config["alpha"],
+                              config["model_paras"]["img_channels"] * config["model_paras"]["clip_pred"],
+                              device).to(device)
+    intensity_loss = Intensity_Loss(l_num=config["intensity_loss_norm"]).to(device)
 
     model = HFVAD(num_hist=config["model_paras"]["clip_hist"],
                   num_pred=config["model_paras"]["clip_pred"],
@@ -43,118 +46,96 @@ def train(config, training_chunked_samples_dir, testing_chunked_samples_file):
                   num_slots=config["model_paras"]["num_slots"],
                   shrink_thres=config["model_paras"]["shrink_thres"],
                   mem_usage=config["model_paras"]["mem_usage"],
-                  skip_ops=config["model_paras"]["skip_ops"]).to(device)
+                  skip_ops=config["model_paras"]["skip_ops"],
+                  ).to(device)
 
-    # Load ML_MemAE_SC weights (if provided)
-    if config.get("ML_MemAE_SC_pretrained"):
-        ML_state = torch.load(config["ML_MemAE_SC_pretrained"], weights_only=True)["model_state_dict"]
-        model.memAE.load_state_dict(ML_state)
+    # load ML_MemAE_SC weights and fix them
+    ML_MemAE_SC_state_dict = torch.load(config["ML_MemAE_SC_pretrained"])["model_state_dict"]
+    model.memAE.load_state_dict(ML_MemAE_SC_state_dict)
 
-    # optimizer + scheduler
-    optimizer = optim.AdamW(model.parameters(), lr=lr, eps=1e-7, weight_decay=1e-4)
-    # Keep simple StepLR or optionally use Cosine:
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=lr, eps=1e-8, weight_decay=1e-4
+    )   
 
     step = 0
     epoch_last = 0
-    if not config.get("pretrained"):
+    if not config["pretrained"]:
         model.apply(weights_init_kaiming)
     else:
+        assert (config["pretrained"] is not None)
         model_state_dict, optimizer_state_dict, step = loader(config["pretrained"])
         model.load_state_dict(model_state_dict)
         optimizer.load_state_dict(optimizer_state_dict)
 
     writer = SummaryWriter(paths["log_dir"])
-    shutil.copyfile("./cfgs/cfg.yaml", os.path.join(config["log_root"], config["exp_name"], "train_cfg.yaml"))
+    shutil.copyfile("./cfgs/cfg.yaml", os.path.join(config["log_root"], config["exp_name"], "cfg.yaml"))
 
     best_auc = -1
-
-    use_amp = config.get("use_amp", True)
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
-    grad_clip = config.get("grad_clip", 1.0)
+    scheduler = None
 
     for epoch in range(epoch_last, epochs + epoch_last):
         for chunk_file_idx, chunk_file in enumerate(training_chunk_samples_files):
             dataset = Chunked_sample_dataset(os.path.join(training_chunked_samples_dir, chunk_file))
             dataloader = DataLoader(dataset=dataset, batch_size=batch_size, num_workers=num_workers, shuffle=True)
-            pbar = tqdm(enumerate(dataloader), desc=f"Epoch {epoch+1}: Chunk {chunk_file_idx}", total=len(dataloader))
-            for idx, train_data in pbar:
+
+            # tạo scheduler sau khi có số batch/epoch
+            if scheduler is None:
+                scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    optimizer,
+                    max_lr=lr * 10,                       # peak LR gấp 10 lần lr base
+                    steps_per_epoch=len(dataloader),
+                    epochs=epochs,
+                    pct_start=0.2,
+                    anneal_strategy="cos",
+                    div_factor=10,
+                    final_div_factor=1e4 
+                )
+
+            for idx, train_data in tqdm(enumerate(dataloader),
+                                        desc="Training Epoch %d, Chunked File %d" % (epoch + 1, chunk_file_idx),
+                                        total=len(dataloader)):
                 model.train()
+
                 sample_frames, sample_ofs, _, _, _ = train_data
-                sample_frames = sample_frames.to(device)
                 sample_ofs = sample_ofs.to(device)
+                sample_frames = sample_frames.to(device)
+
+                out = model(sample_frames, sample_ofs, mode="train")
+
+                loss_kl = aggregate_kl_loss(out["q_means"], out["p_means"])
+                loss_frame = intensity_loss(out["frame_pred"], out["frame_target"])
+                loss_grad = grad_loss(out["frame_pred"], out["frame_target"])
+
+                loss_all = config["lam_kl"] * loss_kl + \
+                           config["lam_frame"] * loss_frame + \
+                           config["lam_grad"] * loss_grad
 
                 optimizer.zero_grad()
-                with torch.amp.autocast('cuda', enabled=use_amp):
-                    out = model(sample_frames, sample_ofs, mode="train")
-                    # out is expected to include: 'q_means','p_means','frame_pred','frame_target','loss_recon','loss_sparsity'
-                    losses = combined_loss(out, out["frame_target"])
-                    loss_all = losses["loss_all"]
-
-                scaler.scale(loss_all).backward()
-                # gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                loss_all.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                scheduler.step()   # cập nhật LR theo batch
 
                 if step % config["logevery"] == config["logevery"] - 1:
-                    # log scalars
-                    pbar.set_postfix({'loss': float(loss_all.detach().cpu())})
-                    writer.add_scalar('loss_total/train', float(loss_all.detach().cpu()), global_step=step + 1)
-                    writer.add_scalar('loss_frame/train', float(losses["loss_frame"].detach().cpu()), global_step=step + 1)
-                    writer.add_scalar('loss_kl/train', float(losses["loss_kl"].detach().cpu()), global_step=step + 1)
-                    writer.add_scalar('loss_grad/train', float(losses["loss_grad"].detach().cpu()), global_step=step + 1)
-                    writer.add_scalar('loss_recon/train', float(losses["loss_recon"].detach().cpu()), global_step=step + 1)
-                    writer.add_scalar('loss_sparsity/train', float(losses["loss_sparsity"].detach().cpu()), global_step=step + 1)
+                    print("[Step: {}/ Epoch: {}]: Loss: {:.4f} ".format(step + 1, epoch + 1, loss_all))
 
-                    if "loss_percep" in losses:
-                        writer.add_scalar('loss_percep/train', float(losses["loss_percep"].detach().cpu()), global_step=step + 1)
-                    if "loss_ssim" in losses:
-                        writer.add_scalar('loss_ssim/train', float(losses["loss_ssim"].detach().cpu()), global_step=step + 1)
-
-                    # images
-                    num_vis = min(6, sample_frames.size(0))
-                    writer.add_figure("img/train_sample_frames",
-                                      visualize_sequences(img_batch_tensor2numpy(
-                                          sample_frames.cpu()[:num_vis, :, :, :]),
-                                          seq_len=sample_frames.size(1) // 3,
-                                          return_fig=True),
-                                      global_step=step + 1)
-                    writer.add_figure("img/train_frame_recon",
-                                      visualize_sequences(img_batch_tensor2numpy(
-                                          out["frame_pred"].detach().cpu()[:num_vis, :, :, :]),
-                                          seq_len=config["model_paras"]["clip_pred"],
-                                          return_fig=True),
-                                      global_step=step + 1)
-
-                    writer.add_figure("img/train_of_target",
-                                      visualize_sequences(img_batch_tensor2numpy(
-                                          sample_ofs.cpu()[:num_vis, :, :, :]),
-                                          seq_len=sample_ofs.size(1) // 2,
-                                          return_fig=True),
-                                      global_step=step + 1)
-                    writer.add_figure("img/train_of_recon",
-                                      visualize_sequences(img_batch_tensor2numpy(
-                                          out["of_recon"].detach().cpu()[:num_vis, :, :, :]),
-                                          seq_len=sample_ofs.size(1) // 2,
-                                          return_fig=True),
-                                      global_step=step + 1)
-
-                    writer.add_scalar('learning_rate', scheduler.get_last_lr()[0], global_step=step + 1)
+                    writer.add_scalar('loss_total/train', loss_all, global_step=step + 1)
+                    writer.add_scalar('loss_frame/train', config["lam_frame"] * loss_frame, global_step=step + 1)
+                    writer.add_scalar('loss_kl/train', config["lam_kl"] * loss_kl, global_step=step + 1)
+                    writer.add_scalar('loss_grad/train', config["lam_grad"] * loss_grad, global_step=step + 1)
+                    writer.add_scalar('learning_rate', optimizer.param_groups[0]["lr"], global_step=step + 1)
 
                 step += 1
             del dataset
             gc.collect()
+            torch.cuda.empty_cache()
 
-        # scheduler per-epoch
-        scheduler.step()
-
-        # saving + evaluation
         if epoch % config["saveevery"] == config["saveevery"] - 1:
             model_save_path = os.path.join(paths["ckpt_dir"], config["model_savename"])
-            saver(model.state_dict(), optimizer.state_dict(), model_save_path, epoch + 1, step, max_to_save=1)
+            saver(model.state_dict(), optimizer.state_dict(), model_save_path, epoch + 1, step, max_to_save=5)
 
+            # compute training stats
             stats_save_path = os.path.join(paths["ckpt_dir"], "training_stats.npy-%d" % (epoch + 1))
             cal_training_stats(config, model_save_path + "-%d" % (epoch + 1), training_chunked_samples_dir,
                                stats_save_path)
@@ -164,7 +145,7 @@ def train(config, training_chunked_samples_dir, testing_chunked_samples_file):
                                testing_chunked_samples_file,
                                stats_save_path,
                                suffix=str(epoch + 1))
-                print(f'AUC: {auc}')
+                print(f'Epoch {epoch+1} AUC: {auc}')
                 if auc > best_auc:
                     best_auc = auc
                     print(f'Best AUC: {best_auc}')
@@ -183,10 +164,12 @@ def cal_training_stats(config, ckpt_path, training_chunked_samples_dir, stats_sa
                   features_root=config["model_paras"]["feature_root"],
                   num_slots=config["model_paras"]["num_slots"],
                   shrink_thres=config["model_paras"]["shrink_thres"],
+                  skip_ops=config["model_paras"]["skip_ops"],
                   mem_usage=config["model_paras"]["mem_usage"],
-                  skip_ops=config["model_paras"]["skip_ops"]).to(device).eval()
+                  ).to(config["device"]).eval()
 
-    model_weights = torch.load(ckpt_path, weights_only=True)["model_state_dict"]
+    # load weights
+    model_weights = torch.load(ckpt_path)["model_state_dict"]
     model.load_state_dict(model_weights)
 
     score_func = nn.MSELoss(reduction="none")
@@ -197,6 +180,7 @@ def cal_training_stats(config, ckpt_path, training_chunked_samples_dir, stats_sa
 
     print("=========Forward pass for training stats ==========")
     with torch.no_grad():
+
         for chunk_file_idx, chunk_file in enumerate(training_chunk_samples_files):
             dataset = Chunked_sample_dataset(os.path.join(training_chunked_samples_dir, chunk_file))
             dataloader = DataLoader(dataset=dataset, batch_size=128, num_workers=0, shuffle=False)

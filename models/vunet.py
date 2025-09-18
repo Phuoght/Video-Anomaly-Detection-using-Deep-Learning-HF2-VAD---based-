@@ -1,10 +1,3 @@
-# Revised VUnet + Swin-like blocks (with per-encoder linear drop-path scheduling)
-# - Adds: shifted-window attention mask, padding for non-divisible H/W,
-#   relative positional bias, safe sampling (dtype/device), DropPath improvements,
-#   mask caching, optional use of SDPA when possible, and small init fixes.
-# - Each SwinEncoder now accepts `drop_path_rate` (max) and applies linear decay across its layers.
-# - Keep external dependencies from `models.basic_modules` as in original.
-
 import math
 import torch
 import torch.nn as nn
@@ -153,18 +146,15 @@ class MHSASDPA(nn.Module):
         self.rel_pos = RelativePositionBias(window_size, num_heads) if window_size is not None else None
 
     def forward(self, x: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
-        # x: (B_, L, C)
         B_, L, C = x.shape
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
-        # reshape to (B_, num_heads, L, head_dim)
         q = q.reshape(B_, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = k.reshape(B_, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v.reshape(B_, L, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Fast path: no mask and no rel_pos -> use SDPA
+        # fast path when possible
         if attn_mask is None and self.rel_pos is None:
-            # F.scaled_dot_product_attention accepts (B, heads, L, head_dim) on recent torch
             try:
                 attn_out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
                 attn_out = attn_out.permute(0, 2, 1, 3).reshape(B_, L, C)
@@ -172,42 +162,51 @@ class MHSASDPA(nn.Module):
                 x = self.proj_drop(x)
                 return x
             except Exception:
-                # fallback to manual computation if environment doesn't support that signature
+                # fallback to stable manual implementation below
                 pass
 
-        # General path: compute manually to support mask and relative bias
-        # q,k: (B, heads, L, d)
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, heads, L, L)
+        # manual attention path (stable)
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B_, heads, L, L)
+
+        # Clip very large values (keep in reasonable numeric range)
+        attn = torch.clamp(attn, min=-1e4, max=1e4)
 
         if self.rel_pos is not None:
-            # rel_pos returns (num_heads, L, L) -> broadcast to (B, heads, L, L)
-            rel_bias = self.rel_pos()
+            rel_bias = self.rel_pos()  # (num_heads, L, L)
             attn = attn + rel_bias.unsqueeze(0)
 
+        # process mask: replace -inf with a large negative finite number (safer for softmax)
         if attn_mask is not None:
-            # attn_mask expected boolean where True indicates position to be masked
-            # Expand attn_mask to (B, heads, L, L) if currently (num_windows, L, L)
             if attn_mask.dtype == torch.bool:
                 if attn_mask.shape[0] == attn.shape[0]:
                     mask = attn_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
                 elif attn_mask.shape[0] == 1:
                     mask = attn_mask.unsqueeze(1).repeat(attn.shape[0], self.num_heads, 1, 1)
                 else:
-                    # try broadcasting
                     mask = attn_mask
                 mask = mask.to(attn.device)
-                attn = attn.masked_fill(mask, float('-inf'))
+                # use a large negative finite value instead of -inf
+                attn = attn.masked_fill(mask, -1e9)
             else:
-                # if float mask additive
                 attn = attn + attn_mask
 
+        # numeric stabilisation: subtract max per-row before softmax
+        attn_max = attn.amax(dim=-1, keepdim=True)
+        attn = attn - attn_max
+
+        # replace NaN/inf that might have appeared
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # now safe softmax
         attn = torch.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
-        out = torch.matmul(attn, v)  # (B, heads, L, d)
+
+        out = torch.matmul(attn, v)
         out = out.permute(0, 2, 1, 3).reshape(B_, L, C)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
+
 
 
 # ------------------------
@@ -449,7 +448,7 @@ class TransformerBlockWithSkip(nn.Module):
             use_sdpa=use_sdpa,
         )
         self.proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
-        self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim, eps=1e-6)
 
     def forward(self, h: Tensor, skip: Tensor) -> Tensor:
         x = torch.cat([h, skip], dim=1)
@@ -475,7 +474,17 @@ class VUnetEncoder(nn.Module):
         n_rnb=2,
         conv_layer=NormConv2d,
         dropout_prob=0.2,
+        drop_path_rate: float = 0.0,
+        transformer_start_stage: int = 2,
     ):
+        """
+        Hybrid VUnetEncoder:
+         - keep ResNet blocks for stages < transformer_start_stage
+         - replace blocks with TransformerBlockWithSkip for stages >= transformer_start_stage
+        Parameters:
+         - drop_path_rate: maximum drop path rate (will be scheduled linearly across stages)
+         - transformer_start_stage: 0-based stage index where Transformer blocks start (default 2)
+        """
         super().__init__()
         self.in_op = conv_layer(nf_in, nf_start, kernel_size=1)
         nf = nf_start
@@ -483,6 +492,9 @@ class VUnetEncoder(nn.Module):
         self.downs = ModuleDict()
         self.n_rnb = n_rnb
         self.n_stages = n_stages
+        self.drop_path_rate = float(drop_path_rate)
+        self.transformer_start_stage = transformer_start_stage
+
         for i_s in range(self.n_stages):
             if i_s > 0:
                 self.downs.update(
@@ -493,19 +505,44 @@ class VUnetEncoder(nn.Module):
                     }
                 )
                 nf = min(2 * nf, nf_max)
+
+            # compute stage-level drop path schedule (proportional to stage index)
+            dp_stage = self.drop_path_rate * (i_s / max(1, self.n_stages - 1))
+
             for ir in range(self.n_rnb):
                 stage = f"s{i_s + 1}_{ir + 1}"
-                self.blocks.update(
-                    {
-                        stage: VUnetResnetBlock(
-                            nf, conv_layer=conv_layer, dropout_prob=dropout_prob
-                        )
-                    }
-                )
+                # if current stage index (i_s, 0-based) >= transformer_start_stage -> use TransformerBlockWithSkip
+                if i_s >= self.transformer_start_stage:
+                    # TransformerBlockWithSkip expects embed_dim == nf
+                    self.blocks.update(
+                        {
+                            stage: TransformerBlockNoSkip(
+                                embed_dim=nf,
+                                num_heads=4,
+                                num_layers=2,
+                                dropout=dropout_prob,
+                                window_size=8,
+                                shift=True,
+                                drop_path_rate=dp_stage,
+                                layerscale_init=1e-6,
+                                use_sdpa=True,
+                            )
+                        }
+                    )
+                else:
+                    # keep ResNet blocks for early stages
+                    self.blocks.update(
+                        {
+                            stage: VUnetResnetBlock(
+                                nf, conv_layer=conv_layer, dropout_prob=dropout_prob
+                            )
+                        }
+                    )
 
     def forward(self, x):
         out = {}
         h = self.in_op(x)
+        # first stage (s1_*): may be ResNet depending on transformer_start_stage
         for ir in range(self.n_rnb):
             h = self.blocks[f"s1_{ir + 1}"](h)
             out[f"s1_{ir + 1}"] = h
@@ -523,9 +560,10 @@ class ZConverter(nn.Module):
         super().__init__()
         self.n_stages = n_stages
         self.device = device
+        self.sample_std = 0.1  # Thêm tham số std
         # pass drop_path_rate down to transformer blocks
         self.blocks = ModuleList([
-            TransformerBlockWithSkip(embed_dim=nf, dropout=dropout_prob, drop_path_rate=drop_path_rate) for _ in range(3)
+            TransformerBlockWithSkip(embed_dim=nf, dropout=dropout_prob, drop_path_rate=drop_path_rate) for _ in range(4)
         ])
         self.conv1x1 = conv_layer(nf, nf, 1)
         self.up = Upsample(in_channels=nf, out_channels=nf, conv_layer=conv_layer)
@@ -553,9 +591,31 @@ class ZConverter(nn.Module):
         return params, zs
 
     def _latent_sample(self, mean: Tensor) -> Tensor:
-        # ensure dtype/device matching
-        sample = mean.new_empty(mean.size()).normal_()
-        return mean + sample
+        """
+        Stable latent sampling:
+        - replace NaN/Inf in mean with finite clipped values
+        - sample eps ~ N(0, sample_std) using torch.randn_like
+        - add eps, clamp output to a safe range
+        """
+        # ensure mean finite
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        # choose std (self.sample_std should be small; clip to a reasonable max)
+        std = float(getattr(self, "sample_std", 0.1))
+        std = max(min(std, 1.0), 1e-6)  # keep std in [1e-6, 1.0] to avoid huge noise
+
+        # sample noise in same device/dtype
+        eps = torch.randn_like(mean) * std
+
+        out = mean + eps
+
+        # final clamp to avoid extremely large values
+        out = torch.clamp(out, min=-10.0, max=10.0)
+
+        # ensure no NaN/Inf after clamp (safety)
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        return out
+
 
 
 class VUnetDecoder(nn.Module):
@@ -623,17 +683,7 @@ class VUnetDecoder(nn.Module):
 
 
 class VUnetBottleneck(nn.Module):
-    def __init__(
-        self,
-        n_stages,
-        nf,
-        device,
-        n_rnb=2,
-        n_auto_groups=4,
-        conv_layer=NormConv2d,
-        dropout_prob=0.2,
-        drop_path_rate=0.0,
-    ):
+    def __init__(self, n_stages, nf, device, n_rnb=2, n_auto_groups=4, conv_layer=NormConv2d, dropout_prob=0.2, drop_path_rate=0.0):
         super().__init__()
         self.device = device
         self.blocks = ModuleDict()
@@ -645,6 +695,8 @@ class VUnetBottleneck(nn.Module):
         self.n_stages = n_stages
         self.n_rnb = n_rnb
         self.n_auto_groups = n_auto_groups
+        # Thêm tham số std để kiểm soát nhiễu
+        self.sample_std = 0.1  # Giá trị nhỏ để kiểm soát nhiễu
         for i_s in range(self.n_stages, self.n_stages - 2, -1):
             self.channel_norm.update({f"s{i_s}": conv_layer(2 * nf, nf, 1)})
             for ir in range(self.n_rnb):
@@ -730,8 +782,30 @@ class VUnetBottleneck(nn.Module):
         return self.depth_to_space(torch.cat(x, dim=1))
 
     def _latent_sample(self, mean: Tensor) -> Tensor:
-        sample = mean.new_empty(mean.size()).normal_()
-        return mean + sample
+        """
+        Stable latent sampling:
+        - replace NaN/Inf in mean with finite clipped values
+        - sample eps ~ N(0, sample_std) using torch.randn_like
+        - add eps, clamp output to a safe range
+        """
+        # ensure mean finite
+        mean = torch.nan_to_num(mean, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        # choose std (self.sample_std should be small; clip to a reasonable max)
+        std = float(getattr(self, "sample_std", 0.1))
+        std = max(min(std, 1.0), 1e-6)  # keep std in [1e-6, 1.0] to avoid huge noise
+
+        # sample noise in same device/dtype
+        eps = torch.randn_like(mean) * std
+
+        out = mean + eps
+
+        # final clamp to avoid extremely large values
+        out = torch.clamp(out, min=-10.0, max=10.0)
+
+        # ensure no NaN/Inf after clamp (safety)
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        return out
 
 
 class VUnet(nn.Module):
@@ -750,7 +824,9 @@ class VUnet(nn.Module):
         num_flows = retrieve(config, "model_paras/num_flows", default=4)
         device = retrieve(config, "device", default="cuda:0")
         # new: drop_path_rate maximum for encoders/bottleneck
-        drop_path_rate = retrieve(config, "model_paras/drop_path_rate", default=0.0)
+        drop_path_rate = retrieve(config, "model_paras/drop_path_rate", default=0.1)
+        # which stage to start replacing ResNet by Transformer (0-based)
+        transformer_start_stage = retrieve(config, "model_paras/transformer_start_stage", default=2)
 
         output_channels = img_channels * clip_pred
         n_stages = 1 + int(np.round(np.log2(spatial_size))) - 2
@@ -762,6 +838,8 @@ class VUnet(nn.Module):
             nf_max=nf_max,
             conv_layer=conv_layer_type,
             dropout_prob=dropout_prob,
+            drop_path_rate=drop_path_rate,
+            transformer_start_stage=transformer_start_stage,
         )
         self.e_theta = VUnetEncoder(
             n_stages=n_stages,
@@ -770,6 +848,8 @@ class VUnet(nn.Module):
             nf_max=nf_max,
             conv_layer=conv_layer_type,
             dropout_prob=dropout_prob,
+            drop_path_rate=drop_path_rate,
+            transformer_start_stage=transformer_start_stage,
         )
         self.zc = ZConverter(
             n_stages=n_stages,
@@ -821,3 +901,5 @@ class VUnet(nn.Module):
         self.saved_tensors = dict(q_means=q_means, p_means=p_means)
         return out_img
 
+
+# End of file

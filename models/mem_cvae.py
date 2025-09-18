@@ -10,7 +10,7 @@ class HFVAD(nn.Module):
     """
 
     def __init__(self, num_hist, num_pred, config, features_root, num_slots, shrink_thres, skip_ops, mem_usage,
-                 finetune=False):
+                 ):
         super(HFVAD, self).__init__()
 
         self.num_hist = num_hist
@@ -20,7 +20,6 @@ class HFVAD(nn.Module):
         self.shrink_thres = shrink_thres
         self.skip_ops = skip_ops
         self.mem_usage = mem_usage
-        self.finetune = finetune
 
         self.x_ch = 3  # num of RGB channels
         self.y_ch = 2  # num of optical flow channels
@@ -56,9 +55,8 @@ class HFVAD(nn.Module):
         att_weight2 = torch.cat(att_weight2_cache, dim=0)
         att_weight1 = torch.cat(att_weight1_cache, dim=0)
 
-        if self.finetune:
-            loss_recon = self.mse_loss(of_recon, sample_of)
-            loss_sparsity = torch.mean(
+        loss_recon = self.mse_loss(of_recon, sample_of)
+        loss_sparsity = torch.mean(
                 torch.sum(-att_weight3 * torch.log(att_weight3 + 1e-12), dim=1)
             ) + torch.mean(
                 torch.sum(-att_weight2 * torch.log(att_weight2 + 1e-12), dim=1)
@@ -76,8 +74,7 @@ class HFVAD(nn.Module):
                    of_recon=of_recon, of_target=sample_of)
         out.update(self.vunet.saved_tensors)
 
-        if self.finetune:
-            ML_MemAE_SC_dict = dict(loss_recon=loss_recon, loss_sparsity=loss_sparsity)
-            out.update(ML_MemAE_SC_dict)
+        ML_MemAE_SC_dict = dict(loss_recon=loss_recon, loss_sparsity=loss_sparsity)
+        out.update(ML_MemAE_SC_dict)
 
         return out
