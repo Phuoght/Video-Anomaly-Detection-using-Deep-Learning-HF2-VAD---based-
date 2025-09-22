@@ -1,4 +1,4 @@
-# Transformer-Enhanced CVAE for Video Anomaly Detection (WIP)
+# Swin Transformer-Enhanced CVAE for Video Anomaly Detection (WIP)
 
 ## Project Status  
 
