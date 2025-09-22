@@ -35,8 +35,8 @@ This project is based on [hf2vad](https://github.com/LiUzHiAn/hf2vad), which ori
 | Dataset      | Method              | AUC (%) |
 |--------------|---------------------|---------|
 | **UCSD Ped2** | CVAE (Original)     | 99.3   |
-|              | **CVAE + Transformer**  | **99.74**   |
+|              | **CVAE + Swin Transformer**  | **99.74**   |
 | **CUHK Avenue** | CVAE (Original)  | 91.1   |
-|              | **CVAE + Transformer**  | **90.5**  |
+|              | **CVAE + Swin Transformer**  | **90.5**  |
 | **ShanghaiTech** | CVAE (Original) | 76.2   |
-|              | **CVAE + Transformer**  | **In-progress** |
+|              | **CVAE + Swin Transformer**  | **In-progress** |
